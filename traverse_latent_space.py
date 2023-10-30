@@ -9,7 +9,7 @@ from torchvision.transforms import ToPILImage
 from lib import *
 from models.gan_load import build_biggan, build_proggan, build_stylegan2, build_sngan
 import numpy as np
-
+from models.vae import ConvVAE
 def text_save(filename, data):
     file = open(filename,'a')
     for i in range(len(data)):
@@ -59,7 +59,7 @@ def build_gan(gan_type, target_classes, stylegan2_resolution, shift_in_w_space, 
         G = build_proggan(pretrained_gan_weights=GAN_WEIGHTS[gan_type]['weights'][GAN_RESOLUTIONS[gan_type]])
     # -- StyleGAN2
     elif gan_type == 'StyleGAN2':
-        G = build_stylegan2(pretrained_gan_weights=GAN_WEIGHTS[gan_type]['weights'][stylegan2_resolution],
+        G = build_stylegan2(pretrained_gan_weights='../stylegan2/checkpoint/360000.pt',
                             resolution=stylegan2_resolution,
                             shift_in_w_space=shift_in_w_space)
     # -- Spectrally Normalised GAN (SNGAN)
@@ -259,16 +259,23 @@ def main():
     if args.verbose:
         print("#. Build GAN generator model G and load with pre-trained weights...")
         print("  \\__GAN type: {}".format(gan_type))
-        print("  \\__Pre-trained weights: {}".format(
-            GAN_WEIGHTS[gan_type]['weights'][args_json.__dict__["stylegan2_resolution"]]
-            if gan_type == 'StyleGAN2' else GAN_WEIGHTS[gan_type]['weights'][GAN_RESOLUTIONS[gan_type]]))
-
-    G = build_gan(gan_type=gan_type,
-                  target_classes=args_json.__dict__["biggan_target_classes"],
-                  stylegan2_resolution=args_json.__dict__["stylegan2_resolution"],
-                  shift_in_w_space=args_json.__dict__["shift_in_w_space"],
-                  use_cuda=use_cuda,
-                  multi_gpu=multi_gpu).eval()
+        if gan_type == 'VAE_MNIST':
+            print("\\__Pre-trained weights: {}".format(models_dir))
+        else:
+            print("  \\__Pre-trained weights: {}".format(
+                GAN_WEIGHTS[gan_type]['weights'][args_json.__dict__["stylegan2_resolution"]]
+                if gan_type == 'StyleGAN2' else GAN_WEIGHTS[gan_type]['weights'][GAN_RESOLUTIONS[gan_type]]))
+    if gan_type == 'VAE_MNIST':
+        G = ConvVAE(num_channel=1, latent_size=18 * 18, img_size=28)
+        G.load_state_dict(torch.load("./models/vae_mnist_conv.pt", map_location='cpu'))
+        print("Load MNIST VAE")
+    else:
+        G = build_gan(gan_type=gan_type,
+                      target_classes=args_json.__dict__["biggan_target_classes"],
+                      stylegan2_resolution=args_json.__dict__["stylegan2_resolution"],
+                      shift_in_w_space=args_json.__dict__["shift_in_w_space"],
+                      use_cuda=use_cuda,
+                      multi_gpu=multi_gpu).eval()
 
     # Build support sets model S
     if args.verbose:
@@ -276,7 +283,7 @@ def main():
 
     S = WavePDE(num_support_sets=args_json.__dict__["num_support_sets"],
                     num_support_timesteps=args_json.__dict__["num_support_timesteps"],
-                    support_vectors_dim=G.dim_z,)
+                    support_vectors_dim=G.latent_size if gan_type=='VAE_MNIST' else G.dim_z)
     #For stylegan remove the last activation layer otherwise the changes are too small
     if gan_type == 'StyleGAN2':
         for i in range(S.num_support_sets):
@@ -298,7 +305,7 @@ def main():
 
     # Create output dir for generated images
     out_dir = osp.join(args.exp, 'results', args.pool,
-                       '{}_{}_{}'.format(2 * args.shift_steps, args.eps, round(2 * args.shift_steps * args.eps, 3)))
+                       '{}_{}_{}_full_path'.format(2 * args.shift_steps, args.eps, round(2 * args.shift_steps * args.eps, 3)))
     os.makedirs(out_dir, exist_ok=True)
 
     # Set default batch size
@@ -385,6 +392,35 @@ def main():
             ##                                                                                                        ##
             ##                    [ Traverse through current path (positive/negative directions) ]                    ##
             ##                                                                                                        ##
+            # == Negative direction ==
+            if args_json.__dict__["shift_in_w_space"]:
+                z = z_.clone().requires_grad_()
+                w = G.get_w(z)
+            else:
+                z = z_.clone().requires_grad_()
+            cnt = 0
+            print("K index:",dim)
+            half_steps = args.shift_steps // 2
+            for step in range(0, half_steps):
+                cnt += 1
+                energy, shift = S.inference(dim, w if args_json.__dict__["shift_in_w_space"] else z,
+                                            step * torch.ones(1, 1, requires_grad=True), G)
+                if shift.dim() == 1:
+                    shift = shift.unsqueeze(0)
+                # shift = shift.unsqueeze(0)
+                # Store latent codes and shifts
+                if cnt == args.shift_leap:
+                    current_path_latent_shifts.append(-args.eps * shift)
+                    current_path_latent_codes.append(w if args_json.__dict__["shift_in_w_space"] else z)
+                    cnt = 0
+                # Update z/w
+                if args_json.__dict__["shift_in_w_space"]:
+                    w = w - args.eps * shift
+                else:
+                    z = z - args.eps * shift
+            current_path_latent_shifts.reverse()
+            current_path_latent_codes.reverse()
+
             # == Positive direction ==
             if args_json.__dict__["shift_in_w_space"]:
                 z = z_.clone().requires_grad_()
@@ -434,6 +470,9 @@ def main():
                     if args_json.__dict__["shift_in_w_space"]:
                         transformed_img.append(G(z=current_path_latent_codes_batches[t],
                                                  shift=current_path_latent_shifts_batches[t]))
+                    elif gan_type == 'VAE_MNIST':
+                        transformed_img.append(G.inference(z=current_path_latent_codes_batches[t] +
+                                                             current_path_latent_shifts_batches[t]))
                     else:
                         transformed_img.append(G(z=current_path_latent_codes_batches[t],
                                                  shift=current_path_latent_shifts_batches[t]))
@@ -541,7 +580,7 @@ def main():
                 save_all=True,
                 optimize=True,
                 loop=0,
-                duration=1000 // args.gif_fps)
+                duration=10000 // args.gif_fps)
 
 
 if __name__ == '__main__':
