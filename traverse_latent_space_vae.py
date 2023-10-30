@@ -8,7 +8,7 @@ import json
 from torchvision.transforms import ToPILImage
 from lib import *
 import numpy as np
-from vae import ConvVAE
+from models.vae import ConvVAE
 
 def text_save(filename, data):
     file = open(filename,'a')
@@ -116,10 +116,11 @@ def main():
     parser.add_argument('--gif', action='store_true', help="Create GIF traversals")
     parser.add_argument('--gif-size', type=int, default=256, help="set gif resolution")
     parser.add_argument('--gif-fps', type=int, default=30, help="set gif frame rate")
-    parser.add_argument("--vae_scratch", type=bool, default=False)
     # ================================================================================================================ #
     parser.add_argument('--cuda', dest='cuda', action='store_true', help="use CUDA during training")
     parser.add_argument('--no-cuda', dest='cuda', action='store_false', help="do NOT use CUDA during training")
+    parser.add_argument("--shapes3d", type=bool, default=False)
+    parser.add_argument("--vae_scratch", type=bool, default=False)
     parser.set_defaults(cuda=True)
     # ================================================================================================================ #
 
@@ -183,7 +184,8 @@ def main():
     if args.shapes3d == True:
         G = ConvVAE(num_channel=3, latent_size=15 * 15 + 1, img_size=64)
     else:
-        G = ConvVAE2(num_channel=3, latent_size=18 * 18, img_size=128)
+        G = ConvVAE(num_channel=3, latent_size=18 * 18, img_size=28)
+        G.load_state_dict(torch.load("./models/vae_mnist_conv3.pt", map_location='cpu'))
         
 
     # Build PDE flows S
@@ -199,8 +201,10 @@ def main():
         print("  \\__Pre-trained weights: {}".format(support_sets_model))
     S.load_state_dict(torch.load(support_sets_model, map_location=lambda storage, loc: storage)['support_sets'])
     if args.vae_scratch:
-        
-        G = ConvVAE(num_channel=3, latent_size=15 * 15 + 1, img_size=64)
+        if args.shapes3d == True:
+            G = ConvVAE(num_channel=3, latent_size=15 * 15 + 1, img_size=64)
+        else:
+            G = ConvVAE(num_channel=3, latent_size=18 * 18, img_size=28)
         G.load_state_dict(torch.load(support_sets_model, map_location=lambda storage, loc: storage)['vae'])
     if args.verbose:
         print("  \\__Set to evaluation mode")
@@ -313,8 +317,8 @@ def main():
             # == Negative direction ==
             for step in range(0,half_steps):
                 cnt += 1
-                energy, shift, _ = S.inference(dim, w if args_json.__dict__["shift_in_w_space"] else z,
-                                               step * torch.ones(1, 1, requires_grad=True),G.decoder)
+                energy, shift = S.inference(dim, w if args_json.__dict__["shift_in_w_space"] else z,
+                                               step * torch.ones(1, 1, requires_grad=True), G)
                 if shift.dim()==1:
                     shift = shift.unsqueeze(0)
                 #shift = shift.unsqueeze(0)
@@ -339,15 +343,15 @@ def main():
             cnt = 0
             for step in range(0,half_steps):
                 cnt += 1
-                energy, shift, _ = S.inference(dim, w if args_json.__dict__["shift_in_w_space"] else z,
-                                       step * torch.ones(1, 1, requires_grad=True),G.decoder)
+                energy, shift = S.inference(dim, w if args_json.__dict__["shift_in_w_space"] else z,
+                                       step * torch.ones(1, 1, requires_grad=True), G)
                 if shift.dim()==1:
                     shift = shift.unsqueeze(0)
                 #shift = shift.unsqueeze(0)
                 if step == 0:
                     energy_wave = np.array(energy.view(-1).cpu().detach().numpy())
-                    shift_wave = np.array(z.view(-1).cpu().detach().numpy())
-                    shift_wave = np.append(shift_wave, np.array(shift.view(-1).cpu().detach().numpy()))
+                    shift_wave = np.array(shift.view(-1).cpu().detach().numpy())
+                    # shift_wave = np.append(shift_wave, np.array(shift.view(-1).cpu().detach().numpy()))
                 else:
                     energy_wave = np.append(energy_wave, np.array(energy.view(-1).cpu().detach().numpy()))
                     shift_wave = np.append(shift_wave, np.array(shift.view(-1).cpu().detach().numpy()))
@@ -363,8 +367,14 @@ def main():
                     w = w + args.eps * shift
                 else:
                     z = z + args.eps * shift
-            text_save(osp.join(transformed_images_root_dir, 'shift_{:03d}.txt'.format(dim)), shift_wave)
-            text_save(osp.join(transformed_images_root_dir, 'wave_{:03d}.txt'.format(dim)), energy_wave)
+            ## text_save(osp.join(transformed_images_root_dir, 'shift_{:03d}.txt'.format(dim)), shift_wave)
+            ## text_save(osp.join(transformed_images_root_dir, 'wave_{:03d}.txt'.format(dim)), energy_wave)
+            # Generate transformed images
+            # Split latent codes and shifts in batches
+            current_path_latent_codes = torch.cat(current_path_latent_codes)
+            current_path_latent_codes_batches = torch.split(current_path_latent_codes, args.batch_size)
+            current_path_latent_shifts = torch.cat(current_path_latent_shifts)
+            current_path_latent_shifts_batches = torch.split(current_path_latent_shifts, args.batch_size)
             if len(current_path_latent_codes_batches) != len(current_path_latent_shifts_batches):
                 raise AssertionError()
             else:
