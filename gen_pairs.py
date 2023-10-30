@@ -15,12 +15,14 @@ import torch.nn as nn
 import os
 import numpy as np
 import cv2
+from scipy.stats import truncnorm
+
 from lib import *
 from models.gan_load import build_biggan, build_proggan, build_stylegan2, build_sngan
 import os.path as osp
 import json
 from torch.nn import functional as F
-
+from models.vae import ConvVAE
 
 class ModelArgs:
     def __init__(self, **kwargs):
@@ -43,7 +45,7 @@ def build_gan(gan_type, target_classes, stylegan2_resolution, shift_in_w_space, 
         G = build_proggan(pretrained_gan_weights=GAN_WEIGHTS[gan_type]['weights'][GAN_RESOLUTIONS[gan_type]])
     # -- StyleGAN2
     elif gan_type == 'StyleGAN2':
-        G = build_stylegan2(pretrained_gan_weights=GAN_WEIGHTS[gan_type]['weights'][stylegan2_resolution],
+        G = build_stylegan2('../stylegan2/checkpoint/360000.pt',
                             resolution=stylegan2_resolution,
                             shift_in_w_space=shift_in_w_space)
     # -- Spectrally Normalised GAN (SNGAN)
@@ -165,19 +167,24 @@ if __name__ == '__main__':
     else:
         torch.set_default_tensor_type('torch.FloatTensor')
 
-    netG = build_gan(gan_type=gan_type,
-                  target_classes=args_json.__dict__["biggan_target_classes"],
-                  stylegan2_resolution=args_json.__dict__["stylegan2_resolution"],
-                  shift_in_w_space=args_json.__dict__["shift_in_w_space"],
-                  use_cuda=use_cuda,
-                  multi_gpu=multi_gpu).eval()
+    if gan_type == 'VAE_MNIST':
+        netG = ConvVAE(num_channel=3, latent_size=18 * 18, img_size=28)
+        netG.load_state_dict(torch.load("./models/vae_mnist_conv3.pt", map_location='cpu'))
+    else:
+        netG = build_gan(gan_type=gan_type,
+                      target_classes=args_json.__dict__["biggan_target_classes"],
+                      stylegan2_resolution=args_json.__dict__["stylegan2_resolution"],
+                      shift_in_w_space=args_json.__dict__["shift_in_w_space"],
+                      use_cuda=use_cuda,
+                      multi_gpu=multi_gpu).eval()
 
     S = WavePDE(num_support_sets=args_json.__dict__["num_support_sets"],
-                num_support_dipoles=args_json.__dict__["num_support_dipoles"],
-                support_vectors_dim=netG.dim_z,
-                learn_alphas=args_json.__dict__["learn_alphas"],
-                learn_gammas=args_json.__dict__["learn_gammas"],
-                gamma=1.0 / netG.dim_z if args_json.__dict__["gamma"] is None else args_json.__dict__["gamma"])
+                num_support_timesteps=args_json.__dict__["num_support_timesteps"],
+                support_vectors_dim=netG.latent_size if gan_type == 'VAE_MNIST' else netG.dim_z)
+                # num_support_dipoles=args_json.__dict__["num_support_dipoles"],
+                # learn_alphas=args_json.__dict__["learn_alphas"],
+                # learn_gammas=args_json.__dict__["learn_gammas"],
+                # gamma=1.0 / netG.dim_z if args_json.__dict__["gamma"] is None else args_json.__dict__["gamma"])
     # For stylegan remove the last activation layer otherwise the changes are too small
     #print(gan_type)
     if gan_type == 'StyleGAN2':
@@ -208,25 +215,25 @@ if __name__ == '__main__':
     n_samples = 40000
     batch_size = 2
     n_batches = n_samples // batch_size
-    print(S.num_support_dipoles)
+    print(S.num_support_timesteps)
 
     for i in range(n_batches):
         print('Generating image pairs %d/%d ...' % (i, n_batches))
         grid_labels = np.zeros([batch_size, 0], dtype=np.float32)
 
-        z_1 = torch.randn(batch_size, netG.dim_z).cuda()
+        z_1 = torch.randn(batch_size, netG.latent_size if gan_type == 'VAE_MNIST' else netG.dim_z).cuda()
 
         #idx = np.array(list(range(100)))  # full
 
         #delta_dim = np.random.randint(0, nz, size=[batch_size])
         #delta_dim = idx[delta_dim]
-        delta_dim = torch.randint(0,S.num_support_sets,(1,1),requires_grad=False)
+        delta_dim = torch.randint(0, S.num_support_sets, (1, 1), requires_grad=False)
 
 
         if args_json.__dict__["shift_in_w_space"]:
             z_1 = netG.get_w(z_1)
         z_shifted = z_1.clone()
-        for step in range(S.num_support_dipoles):
+        for step in range(S.num_support_timesteps):
             _, shift = S.inference(delta_dim, z_shifted, step * torch.ones(1, 1, requires_grad=True), netG)
             z_shifted = z_shifted + shift
      
@@ -237,8 +244,12 @@ if __name__ == '__main__':
             labels = delta_onehot
         else:
             labels = np.concatenate([labels, delta_onehot], axis=0)
-        fakes_1 = netG(z_1)
-        fakes_2 = netG(z_shifted)
+        if gan_type == 'VAE_MNIST':
+            fakes_1 = netG.inference(z_1)
+            fakes_2 = netG.inference(z_shifted)
+        else:
+            fakes_1 = netG(z_1)
+            fakes_2 = netG(z_shifted)
         fakes_1 = F.interpolate(
             fakes_1, size=(256, 256), mode="bilinear", align_corners=False
         )
